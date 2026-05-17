@@ -9,5 +9,5 @@
 mod model;
 mod trainer;
 
-pub use model::{UnigramModel, UnigramPiece};
+pub use model::UnigramModel;
 pub use trainer::UnigramTrainer;

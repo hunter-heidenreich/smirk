@@ -113,8 +113,10 @@ impl UnigramTrainer {
             b.sort();
             b
         };
-        let corpus_glyphs: HashSet<u32> =
-            words.iter().flat_map(|w| w.glyphs().iter().copied()).collect();
+        let corpus_glyphs: HashSet<u32> = words
+            .iter()
+            .flat_map(|w| w.glyphs().iter().copied())
+            .collect();
         let n_multi = self.vocab_size.saturating_sub(base.len() + 1);
         let hf_vocab_size = (n_multi + corpus_glyphs.len()).max(1) as u32;
 

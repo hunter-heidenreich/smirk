@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tokenizers::{Model, OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Result, Token};
+use tokenizers::{
+    Model, OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Result, Token,
+};
 
 use super::trainer::UnigramTrainer;
 use crate::pre_tokenizers::SmirkPreTokenizer;
@@ -71,11 +73,12 @@ impl UnigramModel {
         }
         let unk_id = pieces.len() as u32;
         token_to_id.insert(unk_token.clone(), unk_id);
-        let unk_score = pieces
-            .iter()
-            .map(|p| p.score)
-            .fold(f64::INFINITY, f64::min);
-        let unk_score = if unk_score.is_finite() { unk_score } else { 0.0 };
+        let unk_score = pieces.iter().map(|p| p.score).fold(f64::INFINITY, f64::min);
+        let unk_score = if unk_score.is_finite() {
+            unk_score
+        } else {
+            0.0
+        };
         Self {
             unk_token,
             tokenize,
@@ -111,7 +114,11 @@ impl UnigramModel {
 
 impl Default for UnigramModel {
     fn default() -> Self {
-        Self::new("[UNK]".to_string(), SmirkPreTokenizer::default(), Vec::new())
+        Self::new(
+            "[UNK]".to_string(),
+            SmirkPreTokenizer::default(),
+            Vec::new(),
+        )
     }
 }
 
@@ -165,7 +172,9 @@ impl Model for UnigramModel {
             .into_iter()
             .map(|(start, end, id)| Token {
                 id,
-                value: self.id_to_token(id).unwrap_or_else(|| self.unk_token.clone()),
+                value: self
+                    .id_to_token(id)
+                    .unwrap_or_else(|| self.unk_token.clone()),
                 offsets: (glyphs[start].1 .0, glyphs[end - 1].1 .1),
             })
             .collect())
@@ -237,7 +246,10 @@ impl<'de> Visitor<'de> for UnigramVisitor {
         write!(fmt, "struct UnigramModel")
     }
 
-    fn visit_map<V: MapAccess<'de>>(self, mut map: V) -> std::result::Result<UnigramModel, V::Error> {
+    fn visit_map<V: MapAccess<'de>>(
+        self,
+        mut map: V,
+    ) -> std::result::Result<UnigramModel, V::Error> {
         let mut unk_token: Option<String> = None;
         let mut tokenize: Option<SmirkPreTokenizer> = None;
         let mut pieces: Option<Vec<UnigramPiece>> = None;
