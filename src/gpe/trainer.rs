@@ -2,6 +2,7 @@ use derive_builder::Builder;
 use macro_rules_attribute::derive;
 use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::path::PathBuf;
 use tokenizers::parallelism::{MaybeParallelBridge, MaybeParallelRefIterator};
 use tokenizers::{AddedToken, Result, Trainer};
 
@@ -55,6 +56,12 @@ pub struct GpeTrainer {
     pub merge_brackets: bool,
     // Internal Map for tracking word counts
     word_counts: HashMap<String, u64>,
+    // Step 1.5 scaffold instrumentation (vocab-tokenizer-clms study, main.tex
+    // §3.2): when `Some`, `do_train` streams a per-merge-step JSONL log to this
+    // path. `None` (the default) leaves training byte-identical to stock
+    // output — the instrumentation is logging-only and never alters a merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scaffold_log_path: Option<PathBuf>,
 }
 
 impl Default for GpeTrainer {
@@ -67,6 +74,7 @@ impl Default for GpeTrainer {
             special_tokens: Vec::new(),
             merge_brackets: false,
             word_counts: HashMap::new(),
+            scaffold_log_path: None,
         }
     }
 }
