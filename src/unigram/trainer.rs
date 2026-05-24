@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
-use tokenizers::models::unigram::{Unigram as HfUnigram, UnigramTrainer as HfUnigramTrainer};
 use tokenizers::parallelism::MaybeParallelBridge;
 use tokenizers::{AddedToken, Result, Trainer};
 
+use super::em::train_pieces;
 use super::model::{UnigramModel, UnigramPiece};
-use crate::pua;
+use super::seed::make_seed;
 use crate::shared::{compute_alphabet, tokenize_words};
 
 // §3.2 Unigram-LM hyperparameters frozen by the preregistration. All four
@@ -19,16 +19,17 @@ use crate::shared::{compute_alphabet, tokenize_words};
 /// Unigram-LM sibling trainer — the Unigram arm's analogue of `GpeTrainer`.
 ///
 /// Mirrors `GpeTrainer`'s public knobs and shares the Layer A/B/C front-end
-/// (`compute_alphabet` + `tokenize_words`); it delegates the EM/pruning loop to
-/// HuggingFace's `UnigramTrainer` through the [`crate::pua`] glyph↔char bridge
-/// (`vocab-tokenizer-clms` study, §3.2).
+/// (`compute_alphabet` + `tokenize_words`); it fits the model with a native
+/// EM/prune loop ([`crate::unigram::em`]) faithful to SentencePiece's
+/// `unigram_model_trainer.cc` (`vocab-tokenizer-clms` study, §3.2).
 #[derive(Builder, Debug, Deserialize, Serialize, Clone)]
 #[builder(default)]
 pub struct UnigramTrainer {
-    /// Exposed for `GpeTrainer` API parity only. HuggingFace's `UnigramTrainer`
-    /// has no seed-frequency hook, so no seed-substring cutoff is enforced
-    /// (main.tex §9 amendment, 2026-05-17); rare candidates are excluded by
-    /// HuggingFace's intrinsic seed scoring and EM pruning.
+    /// Exposed for `GpeTrainer` API parity only. The native trainer follows
+    /// SentencePiece, which has no separate seed-frequency floor (candidate
+    /// substrings must merely occur more than once); rare candidates are
+    /// excluded by `freq * length` seed scoring and likelihood-loss pruning
+    /// (main.tex §9 amendment, 2026-05-17).
     pub min_frequency: u64,
     /// Target vocabulary size.
     pub vocab_size: usize,
@@ -40,20 +41,19 @@ pub struct UnigramTrainer {
     pub special_tokens: Vec<AddedToken>,
     /// Layer C: whether `[` / `]` glyphs are kept in the training stream.
     pub merge_brackets: bool,
-    /// HuggingFace `UnigramTrainer` seed-pool cap. §3.2 freezes this at the
-    /// default (1_000_000); exposed as a knob for the Phase-2.5 seed-cap
+    /// Seed-pool cap (SentencePiece `seed_sentencepiece_size`). §3.2 freezes
+    /// this at the default (1_000_000); exposed for the Phase-2.5 seed-cap
     /// spot-check.
     pub seed_size: usize,
     /// Maximum piece length, in glyphs. §3.2 freezes this at the default
     /// (128); exposed as a knob for the Phase-2 max-piece-length contingency.
     pub max_piece_length: usize,
-    /// HuggingFace `UnigramTrainer` EM sub-iterations per prune round. §3.2
-    /// freezes this at the default (2); exposed as a knob for the Phase-2.5
-    /// prune-schedule spot-check.
+    /// EM sub-iterations per prune round. §3.2 freezes this at the default (2);
+    /// exposed as a knob for the Phase-2.5 prune-schedule spot-check.
     pub n_sub_iterations: u32,
-    /// HuggingFace `UnigramTrainer` shrinking factor (fraction of pieces kept
-    /// per prune round). §3.2 freezes this at the default (0.75); exposed as
-    /// a knob for the Phase-2.5 prune-schedule spot-check.
+    /// Shrinking factor (fraction of pieces kept per prune round). §3.2 freezes
+    /// this at the default (0.75); exposed as a knob for the Phase-2.5
+    /// prune-schedule spot-check.
     pub shrinking_factor: f64,
     /// Internal corpus word-count map, populated by `feed`.
     word_counts: HashMap<String, u64>,
@@ -85,8 +85,9 @@ impl UnigramTrainer {
     /// Train a [`UnigramModel`] from corpus word counts.
     ///
     /// The Layer A/B/C front-end is identical to the BPE arm; the resulting
-    /// glyph-id words are PUA-encoded (one Layer-B chunk per HuggingFace
-    /// `Sentence`) and the EM/pruning loop is delegated to HuggingFace.
+    /// glyph-id pre-tokens feed a native EM/prune loop ([`train_pieces`]). The
+    /// fixed base alphabet is then installed as length-1 pieces, so both arms
+    /// target the same `vocab_size` (`vocab-tokenizer-clms` study, §3.2).
     pub fn do_train(
         &self,
         word_counts: &HashMap<String, u64>,
@@ -112,71 +113,60 @@ impl UnigramTrainer {
             &mut id2w,
         );
 
-        // PUA bridge: one Layer-B chunk becomes one HuggingFace `Sentence`, so
-        // its `\0`-separated suffix array never spans a chunk boundary (§3.2).
-        let sentences: Vec<(String, u32)> = words
+        // Glyph-id pre-tokens with corpus counts, sorted so EM's float
+        // accumulation order is fixed (the trained vocabulary is reproducible).
+        let mut sentences: Vec<(Vec<u32>, i64)> = words
             .iter()
             .zip(counts.iter())
             .filter(|(w, _)| !w.glyphs().is_empty())
-            .map(|(w, &c)| (pua::encode_word(w.glyphs()), c as u32))
+            .map(|(w, &c)| (w.glyphs().to_vec(), c))
             .collect();
+        sentences.sort_by(|a, b| a.0.cmp(&b.0));
 
         // The final vocabulary is the fixed base alphabet plus multi-glyph
         // pieces plus the unknown token; `vocab_size` (mirrored from
-        // `GpeTrainer`) counts all of them. HuggingFace's `vocab_size` instead
-        // counts its single-glyph pieces (one per glyph the corpus exercised)
-        // plus its multi-glyph pieces — so ask it for a target that nets the
-        // right multi-glyph count once the base and unk are accounted for.
+        // `GpeTrainer`) counts all of them. The EM targets the multi-glyph
+        // budget plus the corpus-exercised single glyphs (the pieces it can
+        // actually fit); finalize trims to exactly that count.
         let base: Vec<String> = {
             let mut b: Vec<String> = self.alphabet.iter().cloned().collect();
             b.sort();
             b
         };
-        let corpus_glyphs: HashSet<u32> = words
+        let required: HashSet<u32> = sentences
             .iter()
-            .flat_map(|w| w.glyphs().iter().copied())
+            .flat_map(|(g, _)| g.iter().copied())
             .collect();
         let n_multi = self.vocab_size.saturating_sub(base.len() + 1);
-        let hf_vocab_size = (n_multi + corpus_glyphs.len()).max(1) as u32;
+        let target = n_multi + required.len();
 
-        // Delegate the EM/pruning loop to HuggingFace's UnigramTrainer.
-        let hf_trainer = HfUnigramTrainer::builder()
-            .show_progress(false)
-            .vocab_size(hf_vocab_size)
-            .n_sub_iterations(self.n_sub_iterations)
-            .shrinking_factor(self.shrinking_factor)
-            .max_piece_length(self.max_piece_length)
-            .seed_size(self.seed_size)
-            .build()
-            .expect("UnigramTrainer hyperparameters are valid");
-        let mut hf_model = HfUnigram::default();
-        hf_trainer.do_train(sentences, &mut hf_model)?;
+        let seed = make_seed(&sentences, self.max_piece_length, self.seed_size);
+        let trained = train_pieces(
+            seed,
+            &sentences,
+            target,
+            self.n_sub_iterations,
+            self.shrinking_factor,
+            &required,
+        );
 
-        // Decode trained PUA pieces back to glyph-string sequences. HuggingFace's
-        // `<UNK>` / special-token entries are not PUA strings and are skipped —
-        // PUA codepoints never reach the saved model. Single-glyph pieces feed
-        // the base alphabet's scores; multi-glyph pieces are kept as trained.
+        // Split the trained pieces: single-glyph scores feed the base alphabet,
+        // multi-glyph pieces (glyph ids -> glyph strings) are kept as trained.
+        let mut single_scores: HashMap<u32, f64> = HashMap::new();
         let mut multi: Vec<UnigramPiece> = Vec::new();
-        let mut single_scores: HashMap<String, f64> = HashMap::new();
-        let mut seen: HashSet<Vec<String>> = HashSet::new();
-        for entry in hf_model.iter() {
-            let token = &entry.0;
-            let score = entry.1;
-            if !pua::is_pua(token) {
-                continue;
-            }
-            let glyphs: Vec<String> = pua::decode_piece(token)
-                .into_iter()
-                .map(|g| id2w[g as usize].clone())
-                .collect();
+        for (glyphs, score) in &trained {
             match glyphs.as_slice() {
-                [glyph] => {
-                    single_scores.insert(glyph.clone(), score);
+                [g] => {
+                    single_scores.insert(*g, *score);
                 }
-                _ if seen.insert(glyphs.clone()) => {
-                    multi.push(UnigramPiece { glyphs, score });
+                _ => {
+                    let strs: Vec<String> =
+                        glyphs.iter().map(|&g| id2w[g as usize].clone()).collect();
+                    multi.push(UnigramPiece {
+                        glyphs: strs,
+                        score: *score,
+                    });
                 }
-                _ => {}
             }
         }
 
@@ -191,7 +181,10 @@ impl UnigramTrainer {
         let mut pieces: Vec<UnigramPiece> = base
             .into_iter()
             .map(|glyph| {
-                let score = single_scores.get(&glyph).copied().unwrap_or(floor);
+                let score = w2id
+                    .get(&glyph)
+                    .and_then(|id| single_scores.get(id).copied())
+                    .unwrap_or(floor);
                 UnigramPiece {
                     glyphs: vec![glyph],
                     score,
@@ -345,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_custom_seed_size_still_trains() {
-        // The seed_size knob reaches HuggingFace's builder and trains cleanly.
+        // The seed_size knob reaches the native seed extractor and trains cleanly.
         let mut model = empty_model();
         trainer_with(32, 128)
             .do_train(&word_counts(), &mut model)
@@ -357,9 +350,9 @@ mod tests {
 
     #[test]
     fn a_custom_prune_schedule_still_trains() {
-        // The n_sub_iterations / shrinking_factor knobs reach HuggingFace's
-        // builder and the trainer produces a usable model with the coarsened
-        // §3.2 spot-check schedule.
+        // The n_sub_iterations / shrinking_factor knobs drive the native EM/prune
+        // loop and the trainer produces a usable model with the coarsened §3.2
+        // spot-check schedule.
         let alphabet: HashSet<String> =
             ["C", "O", "S", "N"].into_iter().map(String::from).collect();
         let trainer = UnigramTrainer {
