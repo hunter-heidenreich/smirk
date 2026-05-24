@@ -29,11 +29,6 @@ CONFIGS = [
 PUA_LO, PUA_HI = 0xE000, 0xF8FF
 
 
-def _piece_set(**config) -> list[str]:
-    tok = smirk.train_unigram([str(SMILE_TEST_FILE)], vocab_size=256, **config)
-    return sorted(tok.get_vocab().keys())
-
-
 @pytest.fixture(scope="session", params=CONFIGS)
 def trained(request):
     return smirk.train_unigram([str(SMILE_TEST_FILE)], vocab_size=256, **request.param)
@@ -74,15 +69,20 @@ def test_vocab_size_counts_base_plus_pieces():
 
 
 @pytest.mark.parametrize("config", CONFIGS)
-def test_training_is_piece_set_deterministic(config):
-    # §3.2 determinism amendment: the Unigram piece *set* is reproducible
-    # across retraining on identical input (ids / scores may permute).
-    assert _piece_set(**config) == _piece_set(**config)
+def test_training_is_deterministic(config):
+    # The native EM trainer is single-threaded with total-order tie-breaks, so
+    # retraining on identical input yields a byte-identical artifact. This is
+    # stronger than (and supersedes) the original §3.2 piece-set-only
+    # determinism amendment, which was forced by HuggingFace's non-deterministic
+    # delegate.
+    a = smirk.train_unigram([str(SMILE_TEST_FILE)], vocab_size=256, **config)
+    b = smirk.train_unigram([str(SMILE_TEST_FILE)], vocab_size=256, **config)
+    assert a.to_str() == b.to_str()
 
 
 def test_max_piece_length_caps_multi_glyph_pieces():
     # main.tex §3.2: max_piece_length is a settable knob. A one-glyph cap
-    # leaves HuggingFace no multi-glyph pieces to seed, so the trained
+    # leaves the seed extractor no multi-glyph candidates, so the trained
     # vocabulary is strictly smaller than an uncapped run at the same target.
     capped = smirk.train_unigram(
         [str(SMILE_TEST_FILE)], vocab_size=256, max_piece_length=1
