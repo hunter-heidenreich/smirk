@@ -1,14 +1,15 @@
-"""Differential parity: the native Unigram-LM trainer vs reference SentencePiece.
+"""Differential parity: Smirk's Unigram-LM trainer vs reference SentencePiece.
 
-SentencePiece (Kudo's reference Unigram-LM) is the oracle. On the identical
-Smirk-glyph stream, the native trainer's multi-glyph piece set agrees strongly
-with SentencePiece's. Exact equality is not expected: Smirk force-installs its
-full base alphabet as single pieces (every glyph, used or not) where
-SentencePiece installs only corpus-exercised characters, a by-design budget
-difference. We control for it by matching SentencePiece's target to the native
-trainer's multi-piece count, then require a high Jaccard. This test is the
-regression guard against reintroducing a divergence from SentencePiece (e.g. the
-prune bugs the native trainer was written to avoid).
+Smirk delegates Unigram training to HuggingFace ``tokenizers`` (pinned to a fork
+carrying the per-piece-alternatives prune fix, HF PR #2070). SentencePiece
+(Kudo's reference Unigram-LM) is the oracle: on the identical Smirk-glyph stream,
+Smirk's multi-glyph piece set agrees strongly with SentencePiece's. Exact
+equality is not expected — Smirk force-installs its full base alphabet as single
+pieces (every glyph, used or not) where SentencePiece installs only
+corpus-exercised characters, a by-design budget difference. We control for it by
+matching SentencePiece's target to Smirk's multi-piece count, then require a high
+Jaccard. This test guards against a divergence from SentencePiece in the
+delegated trainer.
 """
 
 import json
@@ -46,7 +47,7 @@ def _corpus(n=4000, seed=0):
     ]
 
 
-def _native_multi(path, vocab_size):
+def _smirk_multi(path, vocab_size):
     tok = smirk.train_unigram([str(path)], vocab_size=vocab_size, max_piece_length=128)
     with tempfile.TemporaryDirectory() as d:
         tok.save_pretrained(d)
@@ -69,7 +70,9 @@ def _glyph_stream(molecules):
                 if g not in ("[", "]") and g not in special
             ]
             if glyphs:
-                lines.append("".join(g2c.setdefault(g, chr(PUA_BASE + len(g2c))) for g in glyphs))
+                lines.append(
+                    "".join(g2c.setdefault(g, chr(PUA_BASE + len(g2c))) for g in glyphs)
+                )
     return lines, {c: g for g, c in g2c.items()}
 
 
@@ -107,22 +110,22 @@ def _sp_multi(molecules, vocab_size):
     return out, n_glyphs
 
 
-def test_native_matches_sentencepiece():
+def test_unigram_matches_sentencepiece():
     mols = _corpus()
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "corpus.smi"
         path.write_text("\n".join(mols))
-        native = _native_multi(path, vocab_size=256)
+        smirk_pieces = _smirk_multi(path, vocab_size=256)
 
-    # Match SentencePiece's target to the native multi-piece count plus its
+    # Match SentencePiece's target to Smirk's multi-piece count plus its
     # (corpus-only) base, so both trainers get the same multi-glyph budget.
     _, n_glyphs = _sp_multi(mols, vocab_size=64)
-    sp, _ = _sp_multi(mols, vocab_size=len(native) + n_glyphs + 1)
+    sp, _ = _sp_multi(mols, vocab_size=len(smirk_pieces) + n_glyphs + 1)
 
-    inter = native & sp
-    union = native | sp
+    inter = smirk_pieces & sp
+    union = smirk_pieces | sp
     jac = len(inter) / len(union)
     assert jac >= 0.6, (
-        f"native vs SentencePiece Jaccard {jac:.3f} too low "
-        f"(native={len(native)}, sp={len(sp)}, shared={len(inter)})"
+        f"Smirk vs SentencePiece Jaccard {jac:.3f} too low "
+        f"(smirk={len(smirk_pieces)}, sp={len(sp)}, shared={len(inter)})"
     )
