@@ -70,14 +70,14 @@ def test_vocab_size_counts_base_plus_pieces():
 
 @pytest.mark.parametrize("config", CONFIGS)
 def test_training_is_deterministic(config):
-    # The native EM trainer is single-threaded with total-order tie-breaks, so
-    # retraining on identical input yields a byte-identical artifact. This is
-    # stronger than (and supersedes) the original §3.2 piece-set-only
-    # determinism amendment, which was forced by HuggingFace's non-deterministic
-    # delegate.
+    # §3.2 determinism amendment: training delegates to HuggingFace's Unigram
+    # trainer, so the reproducible invariant is the piece *set*, not a
+    # byte-identical artifact — HuggingFace's E-step is a parallel f64 reduction,
+    # so scores can jitter. conftest pins TOKENIZERS_PARALLELISM=false to keep
+    # even the scores stable across runs.
     a = smirk.train_unigram([str(SMILE_TEST_FILE)], vocab_size=256, **config)
     b = smirk.train_unigram([str(SMILE_TEST_FILE)], vocab_size=256, **config)
-    assert a.to_str() == b.to_str()
+    assert sorted(a.get_vocab()) == sorted(b.get_vocab())
 
 
 def test_max_piece_length_caps_multi_glyph_pieces():

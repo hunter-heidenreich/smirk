@@ -2,15 +2,11 @@
 //!
 //! Mirrors `src/gpe/` (the BPE arm). [`UnigramModel`] holds a glyph-piece
 //! vocabulary and segments by Viterbi argmax; [`UnigramTrainer`] mirrors
-//! `GpeTrainer`'s knobs and shared Layer A/B/C front-end and fits the model
-//! with a native EM/prune loop faithful to SentencePiece (`vocab-tokenizer-clms`
-//! study, §3.2). The EM ([`em`]), lattice ([`lattice`]), and seed extraction
-//! ([`seed`]) operate on glyph-id sequences directly.
+//! `GpeTrainer`'s knobs and shared Layer A/B/C front-end and delegates the
+//! EM/pruning loop to HuggingFace's `UnigramTrainer` through the
+//! [`crate::pua`] glyph↔char bridge (`vocab-tokenizer-clms` study, §3.2).
 
-mod em;
-mod lattice;
 mod model;
-mod seed;
 mod trainer;
 
 pub use model::UnigramModel;

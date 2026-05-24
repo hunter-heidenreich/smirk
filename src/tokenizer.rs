@@ -374,7 +374,10 @@ impl SmirkTokenizer {
                 })
             })
             .collect::<Result<Vec<AddedToken>, PyErr>>()?;
-        Ok(self.tokenizer.add_tokens(&tokens))
+        // tokenizers 0.23 takes an owned iterator and returns a Result.
+        self.tokenizer
+            .add_tokens(tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     #[pyo3(signature = (files, **kwargs))]
